@@ -366,3 +366,207 @@ HAL_GPIO_Init(GPIOB, &gpio);
 3. **LCD 背景色**：所有黑色背景页面必须在 `lcd_clear()` 前执行 `g_back_color = 0x0000`，否则文字周围出现白色矩形。
 4. **SPI1 共享**：W25Q128 和 NRF24L01 共用 PB3/PB4/PB5，通过各自 CS（PB14 / PG7）分时复用，不可同时拉低 CS。
 5. **FSMC 引脚只读**：所有 FSMC 相关引脚（约 40 个）在系统运行期间不可重配置为 GPIO。
+6. **NVIC 分组**：`HAL_Init()` 已将 NVIC 设为 `NVIC_PRIORITYGROUP_4`（4位抢占、0位子优先级），全工程只有抢占优先级有效，`HAL_NVIC_SetPriority` 的第三个参数（子优先级）填任何值都无实际意义。
+7. **中断回调 delay_ms 禁用**：`HAL_GPIO_EXTI_Callback` 中用 `delay_ms(20)` 消抖是官方示例的简化写法，**生产代码中禁止在中断上下文调用任何阻塞延时**，改用标志位 + 主循环二次采样。
+8. **DMA 流控/轮询**：使用 `HAL_UART_Transmit_DMA` 后系统会自动开启 DMA 中断，若采用轮询方式（`__HAL_DMA_GET_FLAG`）则不需编写 IRQHandler，两者不可混用。
+
+---
+
+## 9. NVIC & EXTI 外部中断
+
+### 9.1 本板按键 EXTI 映射
+
+| 按键 | GPIO | EXTI线 | IRQn | IRQHandler | 触发方式 | 内部上下拉 |
+|------|------|--------|------|------------|----------|------------|
+| KEY_UP | PA0 | EXTI0 | `EXTI0_IRQn` | `EXTI0_IRQHandler` | 上升沿 | `GPIO_PULLDOWN` |
+| KEY2 | PE2 | EXTI2 | `EXTI2_IRQn` | `EXTI2_IRQHandler` | 下降沿 | `GPIO_PULLUP` |
+| KEY1 | PE3 | EXTI3 | `EXTI3_IRQn` | `EXTI3_IRQHandler` | 下降沿 | `GPIO_PULLUP` |
+| KEY0 | PE4 | EXTI4 | `EXTI4_IRQn` | `EXTI4_IRQHandler` | 下降沿 | `GPIO_PULLUP` |
+
+> EXTI0~4 各有独立 IRQ；EXTI5~9 共用 `EXTI9_5_IRQn`；EXTI10~15 共用 `EXTI15_10_IRQn`。
+> 同一 EXTI 线同时只能映射一个 GPIO 口（如 EXTI4 只能连 PA4/PB4/PC4/PD4/PE4 中的一个）。
+
+### 9.2 exti.h 宏定义模板（照抄可用）
+
+```c
+/* exti.h — 以 KEY0(PE4) 为例，其余按键仿此 */
+#define KEY0_INT_GPIO_PORT          GPIOE
+#define KEY0_INT_GPIO_PIN           GPIO_PIN_4
+#define KEY0_INT_GPIO_CLK_ENABLE()  do{ __HAL_RCC_GPIOE_CLK_ENABLE(); }while(0)
+#define KEY0_INT_IRQn               EXTI4_IRQn
+#define KEY0_INT_IRQHandler         EXTI4_IRQHandler
+
+/* KEY_UP(PA0) */
+#define WKUP_INT_GPIO_PORT          GPIOA
+#define WKUP_INT_GPIO_PIN           GPIO_PIN_0
+#define WKUP_INT_GPIO_CLK_ENABLE()  do{ __HAL_RCC_GPIOA_CLK_ENABLE(); }while(0)
+#define WKUP_INT_IRQn               EXTI0_IRQn
+#define WKUP_INT_IRQHandler         EXTI0_IRQHandler
+```
+
+### 9.3 extix_init() 完整模板
+
+```c
+void extix_init(void)
+{
+    GPIO_InitTypeDef gpio_init_struct;
+
+    key_init();   /* 先初始化 GPIO 普通输入（可在 key_init 内完成） */
+
+    /* KEY0 PE4 — 下降沿，内部上拉 */
+    gpio_init_struct.Pin  = KEY0_INT_GPIO_PIN;
+    gpio_init_struct.Mode = GPIO_MODE_IT_FALLING;
+    gpio_init_struct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(KEY0_INT_GPIO_PORT, &gpio_init_struct);
+
+    /* KEY_UP PA0 — 上升沿，内部下拉 */
+    gpio_init_struct.Pin  = WKUP_INT_GPIO_PIN;
+    gpio_init_struct.Mode = GPIO_MODE_IT_RISING;
+    gpio_init_struct.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(WKUP_INT_GPIO_PORT, &gpio_init_struct);
+
+    /* NVIC：HAL_Init 已设 PRIORITYGROUP_4，第三参数子优先级无意义填0即可 */
+    HAL_NVIC_SetPriority(KEY0_INT_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(KEY0_INT_IRQn);
+
+    HAL_NVIC_SetPriority(WKUP_INT_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(WKUP_INT_IRQn);
+}
+```
+
+### 9.4 ISR + 回调标准写法
+
+```c
+/* exti.c — ISR（照此模式复制，只改 PIN 宏名）*/
+void KEY0_INT_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(KEY0_INT_GPIO_PIN);   /* 清标志 + 调回调 */
+    __HAL_GPIO_EXTI_CLEAR_IT(KEY0_INT_GPIO_PIN);   /* ⚠️ 二次清标志防抖动误触 */
+}
+
+/* 回调：所有 EXTI 线共用此函数，用 GPIO_Pin 区分来源 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    /* ⚠️ 此处 delay_ms(20) 仅用于官方示例演示，生产代码禁止在 ISR 内 delay！
+       生产做法：设标志位 → 主循环轮询二次采样 */
+    switch (GPIO_Pin)
+    {
+        case KEY0_INT_GPIO_PIN:
+            if (KEY0 == 0) { LED0_TOGGLE(); }
+            break;
+        case WKUP_INT_GPIO_PIN:
+            if (WK_UP == 1) { BEEP_TOGGLE(); }
+            break;
+        default: break;
+    }
+}
+```
+
+---
+
+## 10. DMA 直接存储器访问
+
+### 10.1 本板常用 DMA 流-通道映射
+
+> STM32F407 有 DMA1 和 DMA2，每个控制器 8 个 Stream，每 Stream 8 个 Channel。
+> **仅 DMA2** 支持存储器到存储器（Mem→Mem）传输。
+
+| 外设 | 方向 | DMA控制器 | Stream | Channel | 标志宏 |
+|------|------|-----------|--------|---------|--------|
+| USART1 TX | Mem→Periph | DMA2 | Stream7 | CH4 | `DMA_FLAG_TCIF3_7` |
+| USART1 RX | Periph→Mem | DMA2 | Stream2 | CH4 | `DMA_FLAG_TCIF2_6` |
+| USART2 TX | Mem→Periph | DMA1 | Stream6 | CH4 | `DMA_FLAG_TCIF2_6`（DMA1） |
+| USART3 TX | Mem→Periph | DMA1 | Stream3 | CH4 | `DMA_FLAG_TCIF3_7`（DMA1） |
+| SPI1 TX   | Mem→Periph | DMA2 | Stream3 | CH3 | `DMA_FLAG_TCIF3_7` |
+| SPI1 RX   | Periph→Mem | DMA2 | Stream0 | CH3 | `DMA_FLAG_TCIF0_4` |
+| ADC1      | Periph→Mem | DMA2 | Stream0 | CH0 | `DMA_FLAG_TCIF0_4` |
+
+> `DMA_FLAG_TCIFx_y` 的含义：LISR 管 Stream0~3，HISR 管 Stream4~7，
+> 同一寄存器内 Stream0 和 Stream4 位域相同，所以宏名写成 `TCIF0_4` / `TCIF3_7`。
+
+### 10.2 dma.c 完整模板（USART1 TX，照抄可用）
+
+```c
+/* dma.h */
+extern DMA_HandleTypeDef g_dma_handle;
+void dma_init(DMA_Stream_TypeDef *dma_stream_handle, uint32_t ch);
+
+/* dma.c */
+#include "./BSP/DMA/dma.h"
+DMA_HandleTypeDef g_dma_handle;
+extern UART_HandleTypeDef g_uart1_handle;  /* 在 usart.c 中定义 */
+
+void dma_init(DMA_Stream_TypeDef *dma_stream_handle, uint32_t ch)
+{
+    /* 1. 自动判断并使能 DMA 时钟 */
+    if ((uint32_t)dma_stream_handle > (uint32_t)DMA2)
+        __HAL_RCC_DMA2_CLK_ENABLE();
+    else
+        __HAL_RCC_DMA1_CLK_ENABLE();
+
+    /* 2. 把 DMA 句柄绑定到 UART1 的 TX 通道 */
+    __HAL_LINKDMA(&g_uart1_handle, hdmatx, g_dma_handle);
+
+    /* 3. 配置 DMA：Mem→Periph，8-bit，单次普通模式 */
+    g_dma_handle.Instance                 = dma_stream_handle;
+    g_dma_handle.Init.Channel             = ch;
+    g_dma_handle.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    g_dma_handle.Init.PeriphInc           = DMA_PINC_DISABLE;   /* 外设地址不递增 */
+    g_dma_handle.Init.MemInc              = DMA_MINC_ENABLE;    /* 内存地址递增 */
+    g_dma_handle.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    g_dma_handle.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    g_dma_handle.Init.Mode                = DMA_NORMAL;          /* 单次，非循环 */
+    g_dma_handle.Init.Priority            = DMA_PRIORITY_MEDIUM;
+    g_dma_handle.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    g_dma_handle.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    g_dma_handle.Init.MemBurst            = DMA_MBURST_SINGLE;
+    g_dma_handle.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+
+    HAL_DMA_DeInit(&g_dma_handle);
+    HAL_DMA_Init(&g_dma_handle);
+}
+```
+
+### 10.3 main.c 调用示例（轮询方式）
+
+```c
+/* 初始化 */
+dma_init(DMA2_Stream7, DMA_CHANNEL_4);   /* USART1 TX */
+
+/* 触发一次 DMA 发送（KEY0 按下后）*/
+HAL_UART_Transmit_DMA(&g_uart1_handle, g_sendbuf, SEND_BUF_SIZE);
+
+/* 轮询等待完成（发送期间可同时刷新 LCD 显示进度）*/
+while (1)
+{
+    if (__HAL_DMA_GET_FLAG(&g_dma_handle, DMA_FLAG_TCIF3_7))  /* Stream7 完成 */
+    {
+        __HAL_DMA_CLEAR_FLAG(&g_dma_handle, DMA_FLAG_TCIF3_7);
+        HAL_UART_DMAStop(&g_uart1_handle);   /* ⚠️ 必须显式停止，否则无法重新发送 */
+        break;
+    }
+    /* 计算进度百分比 */
+    float remaining = __HAL_DMA_GET_COUNTER(&g_dma_handle);  /* 剩余项数 */
+    float pct = (1.0f - remaining / SEND_BUF_SIZE) * 100.0f;
+    lcd_show_num(30, 150, (uint32_t)pct, 3, 16, BLUE);
+}
+```
+
+### 10.4 DMA 中断方式（替代轮询）
+
+```c
+/* 若不轮询，可使用回调（需在 NVIC 使能 DMA2_Stream7_IRQn）：*/
+void DMA2_Stream7_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&g_dma_handle);   /* HAL 统一入口，内部分发回调 */
+}
+
+/* UART DMA 发送完成回调（HAL 弱函数，用户重写）*/
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &g_uart1_handle)
+    {
+        /* 发送完成处理逻辑 */
+    }
+}
+```
